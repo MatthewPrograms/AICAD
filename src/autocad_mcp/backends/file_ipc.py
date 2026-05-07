@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -29,6 +30,23 @@ log = structlog.get_logger()
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
+RETRIGGER_ATTEMPTS = 2
+RETRIGGER_INTERVAL = max(1.5, TIMEOUT / 3.0)
+
+def _preview_for_log(value, max_len: int = 800) -> str:
+    """Render a bounded preview string suitable for structured logs."""
+    if value is None:
+        return "null"
+    try:
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        text = repr(value)
+    if len(text) > max_len:
+        return text[:max_len] + "...<truncated>"
+    return text
 
 
 def find_autocad_window() -> int | None:
@@ -61,7 +79,7 @@ class FileIPCBackend(AutoCADBackend):
         self._command_hwnd: int | None = None
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
-        self._lock = asyncio.Lock()  # Single in-flight command
+        self._lock = threading.Lock()  # Single in-flight command across worker threads/loops
 
     @property
     def name(self) -> str:
@@ -134,7 +152,7 @@ class FileIPCBackend(AutoCADBackend):
 
     async def _dispatch(self, command: str, params: dict) -> CommandResult:
         """Send a command via file IPC and wait for result."""
-        async with self._lock:
+        with self._lock:
             return await self._dispatch_unlocked(command, params)
 
     async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
@@ -147,6 +165,12 @@ class FileIPCBackend(AutoCADBackend):
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
             clean_params = {k: v for k, v in params.items() if v is not None}
+            log.info(
+                "ipc_dispatch_start",
+                request_id=request_id,
+                command=command,
+                params=clean_params,
+            )
             # Atomic write: write to .tmp, then rename
             payload = {
                 "request_id": request_id,
@@ -156,12 +180,26 @@ class FileIPCBackend(AutoCADBackend):
             }
             tmp_file.write_text(json.dumps(payload), encoding="utf-8")
             tmp_file.rename(cmd_file)
+            log.debug("ipc_command_file_written", request_id=request_id, path=str(cmd_file))
 
             # Type the fixed dispatch trigger
-            self._type_dispatch_trigger()
+            try:
+                self._type_dispatch_trigger()
+            except Exception as ex:
+                log.exception("dispatch_trigger_failed", request_id=request_id, command=command)
+                return CommandResult(
+                    ok=False,
+                    error=(
+                        "Failed to send dispatch trigger to AutoCAD LT. "
+                        f"{ex} "
+                        "Ensure AutoCAD LT is open with an active drawing, then run Check Connections and retry."
+                    ),
+                )
 
             # Poll for result
             deadline = time.time() + TIMEOUT
+            retrigger_count = 0
+            next_retrigger_ts = time.time() + RETRIGGER_INTERVAL
             while time.time() < deadline:
                 if result_file.exists():
                     try:
@@ -174,6 +212,15 @@ class FileIPCBackend(AutoCADBackend):
                         data = json.loads(text)
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
+                            log.info(
+                                "ipc_dispatch_result",
+                                request_id=request_id,
+                                command=command,
+                                ok=data.get("ok", False),
+                                error=data.get("error"),
+                                payload_type=type(data.get("payload")).__name__,
+                                payload_preview=_preview_for_log(data.get("payload")),
+                            )
                             return CommandResult(
                                 ok=data.get("ok", False),
                                 payload=data.get("payload"),
@@ -181,9 +228,38 @@ class FileIPCBackend(AutoCADBackend):
                             )
                     except (json.JSONDecodeError, OSError):
                         pass  # File may be partially written, retry
+                if retrigger_count < RETRIGGER_ATTEMPTS and time.time() >= next_retrigger_ts:
+                    log.warning(
+                        "ipc_result_not_seen_retriggering_dispatch",
+                        request_id=request_id,
+                        attempt=retrigger_count + 1,
+                    )
+                    try:
+                        self._type_dispatch_trigger()
+                    except Exception as ex:
+                        log.error(
+                            "dispatch_retrigger_failed",
+                            request_id=request_id,
+                            error=str(ex),
+                        )
+                    retrigger_count += 1
+                    next_retrigger_ts = time.time() + RETRIGGER_INTERVAL
                 await asyncio.sleep(POLL_INTERVAL)
-
-            return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
+            log.error(
+                "ipc_dispatch_timeout",
+                request_id=request_id,
+                command=command,
+                timeout_seconds=TIMEOUT,
+                retrigger_attempts=retrigger_count,
+            )
+            return CommandResult(
+                ok=False,
+                error=(
+                    f"Timeout waiting for result (request_id={request_id}). "
+                    "Ensure AutoCAD LT is idle, mcp_dispatch.lsp is loaded, and IPC path matches C:/temp/. "
+                    "Press ESC in AutoCAD to cancel pending prompts, then retry."
+                ),
+            )
 
         finally:
             # Cleanup
@@ -219,29 +295,33 @@ class FileIPCBackend(AutoCADBackend):
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
         """
-        try:
-            import ctypes
+        import ctypes
 
-            WM_CHAR = 0x0102
-            WM_KEYDOWN = 0x0100
-            WM_KEYUP = 0x0101
-            VK_ESCAPE = 0x1B
+        WM_CHAR = 0x0102
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        VK_ESCAPE = 0x1B
+        post = ctypes.windll.user32.PostMessageW
+        target = self._command_hwnd or self._hwnd
+        if not target:
+            self._hwnd = find_autocad_window()
+            self._command_hwnd = self._find_command_line_hwnd()
             target = self._command_hwnd or self._hwnd
-            post = ctypes.windll.user32.PostMessageW
+        if not target:
+            raise RuntimeError("AutoCAD command target window not found.")
+        log.debug("dispatch_target_resolved", hwnd=target, command_hwnd=self._command_hwnd, top_hwnd=self._hwnd)
 
-            # Cancel any pending command (2x ESC for nested commands)
-            for _ in range(2):
-                post(target, WM_KEYDOWN, VK_ESCAPE, 0)
-                post(target, WM_KEYUP, VK_ESCAPE, 0)
-            time.sleep(0.05)
+        # Cancel any pending command (2x ESC for nested commands)
+        for _ in range(2):
+            post(target, WM_KEYDOWN, VK_ESCAPE, 0)
+            post(target, WM_KEYUP, VK_ESCAPE, 0)
+        time.sleep(0.05)
 
-            for ch in "(c:mcp-dispatch)":
-                post(target, WM_CHAR, ord(ch), 0)
-            # Enter = carriage return
-            post(target, WM_CHAR, 0x0D, 0)
-            time.sleep(0.05)
-        except Exception as e:
-            log.error("dispatch_trigger_failed", error=str(e))
+        for ch in "(c:mcp-dispatch)":
+            post(target, WM_CHAR, ord(ch), 0)
+        # Enter = carriage return
+        post(target, WM_CHAR, 0x0D, 0)
+        time.sleep(0.05)
 
     def _cleanup_stale_files(self):
         """Remove stale IPC files from previous sessions."""

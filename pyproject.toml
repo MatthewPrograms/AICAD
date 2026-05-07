@@ -11,6 +11,7 @@ dependencies = [
     "matplotlib>=3.7",
     "Pillow>=10.0.0",
     "structlog>=24.0.0",
+    "httpx>=0.27",
     "pywin32>=305; sys_platform == 'win32'",
 ]
 dev = [
@@ -28,3 +29,6 @@ packages = ["src/autocad_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[project.scripts]
+autocad-mcp-gui = "autocad_mcp.gui_main:main"
