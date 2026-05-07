@@ -22,6 +22,7 @@ from autocad_mcp.agent.planner import ActionPlanner
 from autocad_mcp.agent.scene import SceneGraphBuilder, SceneGraphCache
 from autocad_mcp.backends.base import CommandResult
 from autocad_mcp.backends.file_ipc import FileIPCBackend
+from autocad_mcp.gui.theme import apply_ttk_theme, default_gui_theme, style_canvas, style_scrolled_text
 from autocad_mcp.llm.lmstudio_client import LMStudioClient, LMStudioConfig
 from PIL import Image, ImageTk
 log = structlog.get_logger()
@@ -62,6 +63,8 @@ class AutoCADStandaloneApp:
         self.chat_auto_execute = tk.BooleanVar(value=True)
         self.planning_mode_profile = tk.StringVar(value="fast")
         self.lm_base_url_var = tk.StringVar(value=default_lmstudio_url)
+        self.theme = default_gui_theme()
+        self.style = apply_ttk_theme(self.root, self.theme)
 
         self._build_ui()
         active_log_file = os.environ.get("AUTOCAD_MCP_ACTIVE_LOG_FILE", "").strip()
@@ -70,15 +73,16 @@ class AutoCADStandaloneApp:
             log.info("gui_diagnostics_log_file", path=active_log_file)
 
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root)
+        container = ttk.Frame(self.root, style="App.TFrame")
         container.pack(fill="both", expand=True)
         self.main_canvas = tk.Canvas(container, highlightthickness=0)
+        style_canvas(self.main_canvas, self.theme, background=self.theme.bg)
         self.main_canvas.pack(side="left", fill="both", expand=True)
         self.main_scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.main_canvas.yview)
         self.main_scrollbar.pack(side="right", fill="y")
         self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
 
-        frame = ttk.Frame(self.main_canvas, padding=12)
+        frame = ttk.Frame(self.main_canvas, padding=14, style="Surface.TFrame")
         self.main_canvas_window = self.main_canvas.create_window((0, 0), window=frame, anchor="nw")
         frame.bind(
             "<Configure>",
@@ -91,65 +95,130 @@ class AutoCADStandaloneApp:
         self.main_canvas.bind("<Enter>", self._bind_main_canvas_mousewheel)
         self.main_canvas.bind("<Leave>", self._unbind_main_canvas_mousewheel)
 
-        ttk.Label(frame, textvariable=self.lm_status).pack(anchor="w")
-        ttk.Label(frame, textvariable=self.cad_status).pack(anchor="w")
-        ttk.Label(frame, textvariable=self.plan_status).pack(anchor="w", pady=(0, 8))
-        ttk.Label(frame, textvariable=self.visual_context_status).pack(anchor="w", pady=(0, 8))
-        lm_url_row = ttk.Frame(frame)
-        lm_url_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(lm_url_row, text="LM Studio URL").pack(side="left")
-        ttk.Entry(lm_url_row, textvariable=self.lm_base_url_var, width=52).pack(side="left", padx=(8, 8), fill="x", expand=True)
-        ttk.Button(lm_url_row, text="Apply URL", command=self.apply_lmstudio_url).pack(side="left")
+        status_card = ttk.Frame(frame, style="Card.TFrame", padding=(12, 10))
+        status_card.pack(fill="x", pady=(0, 10))
+        ttk.Label(status_card, text="AICAD Control Center", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(
+            status_card,
+            text="LM Studio planning and AutoCAD LT execution workflow",
+            style="Subtle.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+        status_row = ttk.Frame(status_card, style="Card.TFrame")
+        status_row.pack(fill="x")
+        ttk.Label(status_row, textvariable=self.lm_status, style="Status.TLabel").pack(side="left", padx=(0, 6))
+        ttk.Label(status_row, textvariable=self.cad_status, style="Status.TLabel").pack(side="left", padx=6)
+        ttk.Label(status_row, textvariable=self.plan_status, style="Status.TLabel").pack(side="left", padx=6)
+        ttk.Label(status_card, textvariable=self.visual_context_status, style="Caption.TLabel").pack(anchor="w", pady=(8, 0))
 
-        controls = ttk.Frame(frame)
-        controls.pack(fill="x", pady=(0, 8))
+        lm_url_row = ttk.Frame(status_card, style="Card.TFrame")
+        lm_url_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(lm_url_row, text="LM Studio URL", style="Subtle.TLabel").pack(side="left")
+        ttk.Entry(
+            lm_url_row,
+            textvariable=self.lm_base_url_var,
+            width=52,
+            style="App.TEntry",
+        ).pack(side="left", padx=(8, 8), fill="x", expand=True)
+        ttk.Button(
+            lm_url_row,
+            text="Apply URL",
+            style="Secondary.TButton",
+            command=self.apply_lmstudio_url,
+        ).pack(side="left")
 
-        ttk.Button(controls, text="Check Connections", command=self.check_connections).pack(side="left")
-        ttk.Button(controls, text="Add Reference Image(s)", command=self.add_reference_images).pack(side="left", padx=8)
-        ttk.Button(controls, text="Capture AutoCAD Canvas", command=self.capture_canvas_screenshot).pack(side="left")
-        ttk.Button(controls, text="Clear Visual Context", command=self.clear_visual_context).pack(side="left", padx=8)
+        controls = ttk.LabelFrame(frame, text="Controls", style="App.TLabelframe", padding=(10, 10))
+        controls.pack(fill="x", pady=(0, 10))
+        action_row = ttk.Frame(controls, style="Surface.TFrame")
+        action_row.pack(fill="x")
+        ttk.Button(
+            action_row,
+            text="Check Connections",
+            style="Secondary.TButton",
+            command=self.check_connections,
+        ).pack(side="left")
+        ttk.Button(
+            action_row,
+            text="Add Reference Image(s)",
+            style="Secondary.TButton",
+            command=self.add_reference_images,
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            action_row,
+            text="Capture AutoCAD Canvas",
+            style="Secondary.TButton",
+            command=self.capture_canvas_screenshot,
+        ).pack(side="left")
+        ttk.Button(
+            action_row,
+            text="Clear Visual Context",
+            style="Danger.TButton",
+            command=self.clear_visual_context,
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            action_row,
+            text="Generate Plan",
+            style="Primary.TButton",
+            command=self.generate_plan,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            action_row,
+            text="Execute Approved Plan",
+            style="Primary.TButton",
+            command=self.execute_plan,
+        ).pack(side="left", padx=(8, 0))
+
+        toggle_row = ttk.Frame(controls, style="Surface.TFrame")
+        toggle_row.pack(fill="x", pady=(10, 2))
         ttk.Checkbutton(
-            controls,
+            toggle_row,
             text="Auto-capture canvas before planning",
             variable=self.auto_capture_before_plan,
+            style="App.TCheckbutton",
         ).pack(side="left", padx=8)
         ttk.Checkbutton(
-            controls,
+            toggle_row,
             text="Auto-zoom extents after execution",
             variable=self.auto_zoom_after_execute,
+            style="App.TCheckbutton",
         ).pack(side="left", padx=8)
         ttk.Checkbutton(
-            controls,
+            toggle_row,
             text="Use live AutoCAD context for planning",
             variable=self.use_live_autocad_context,
+            style="App.TCheckbutton",
         ).pack(side="left", padx=8)
-        planning_mode_row = ttk.Frame(frame)
-        planning_mode_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(planning_mode_row, text="Planning mode").pack(side="left")
+        planning_mode_row = ttk.Frame(controls, style="Surface.TFrame")
+        planning_mode_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(planning_mode_row, text="Planning mode", style="Body.TLabel").pack(side="left")
         ttk.Radiobutton(
             planning_mode_row,
             text="Fast mode (text-first, minimal vision)",
             variable=self.planning_mode_profile,
             value="fast",
+            style="App.TRadiobutton",
         ).pack(side="left", padx=(8, 8))
         ttk.Radiobutton(
             planning_mode_row,
             text="Accurate mode (vision-first)",
             variable=self.planning_mode_profile,
             value="accurate",
+            style="App.TRadiobutton",
         ).pack(side="left")
-        ttk.Button(controls, text="Generate Plan", command=self.generate_plan).pack(side="left")
-        ttk.Button(controls, text="Execute Approved Plan", command=self.execute_plan).pack(side="left")
-        self.thumbnail_panel = ttk.LabelFrame(frame, text="Visual Reference Thumbnails")
-        self.thumbnail_panel.pack(fill="x", expand=False, pady=(0, 8))
 
+        self.thumbnail_panel = ttk.LabelFrame(
+            frame,
+            text="Visual Reference Thumbnails",
+            style="App.TLabelframe",
+            padding=(8, 8),
+        )
+        self.thumbnail_panel.pack(fill="x", expand=False, pady=(0, 10))
         self.thumb_canvas = tk.Canvas(self.thumbnail_panel, height=140, highlightthickness=0)
+        style_canvas(self.thumb_canvas, self.theme, background=self.theme.panel_alt)
         self.thumb_canvas.pack(side="top", fill="x", expand=True)
         self.thumb_scroll = ttk.Scrollbar(self.thumbnail_panel, orient="horizontal", command=self.thumb_canvas.xview)
         self.thumb_scroll.pack(side="bottom", fill="x")
         self.thumb_canvas.configure(xscrollcommand=self.thumb_scroll.set)
-
-        self.thumb_inner = ttk.Frame(self.thumb_canvas)
+        self.thumb_inner = ttk.Frame(self.thumb_canvas, style="Card.TFrame")
         self.thumb_window = self.thumb_canvas.create_window((0, 0), window=self.thumb_inner, anchor="nw")
         self.thumb_inner.bind(
             "<Configure>",
@@ -160,56 +229,78 @@ class AutoCADStandaloneApp:
             lambda e: self.thumb_canvas.itemconfigure(self.thumb_window, height=e.height),
         )
 
-        ttk.Label(frame, text="Prompt").pack(anchor="w")
-        self.prompt_input = ScrolledText(frame, height=6, wrap="word")
+        prompt_panel = ttk.LabelFrame(frame, text="Prompt", style="App.TLabelframe", padding=(8, 8))
+        prompt_panel.pack(fill="x", expand=False)
+        self.prompt_input = ScrolledText(prompt_panel, height=6, wrap="word")
+        style_scrolled_text(self.prompt_input, self.theme)
         self.prompt_input.pack(fill="x", expand=False)
         self.prompt_input.insert("1.0", "Draw a line from (0,0) to (100,0) on layer 0.")
-        chat_frame = ttk.LabelFrame(frame, text="Agent chat (scene edits)")
-        chat_frame.pack(fill="both", expand=False, pady=(8, 0))
+
+        chat_frame = ttk.LabelFrame(frame, text="Agent Chat (scene edits)", style="App.TLabelframe", padding=(8, 8))
+        chat_frame.pack(fill="both", expand=False, pady=(10, 0))
         self.chat_output = ScrolledText(chat_frame, height=8, wrap="word", state="disabled")
-        self.chat_output.pack(fill="both", expand=True, padx=4, pady=(4, 4))
-        chat_controls = ttk.Frame(chat_frame)
-        chat_controls.pack(fill="x", padx=4, pady=(0, 4))
+        style_scrolled_text(self.chat_output, self.theme)
+        self.chat_output.pack(fill="both", expand=True)
+        chat_controls = ttk.Frame(chat_frame, style="Surface.TFrame")
+        chat_controls.pack(fill="x", pady=(8, 0))
         self.chat_input = ScrolledText(chat_controls, height=3, wrap="word")
+        style_scrolled_text(self.chat_input, self.theme)
         self.chat_input.pack(side="left", fill="x", expand=True)
-        chat_buttons = ttk.Frame(chat_controls)
+        chat_buttons = ttk.Frame(chat_controls, style="Surface.TFrame")
         chat_buttons.pack(side="left", padx=(8, 0))
-        ttk.Button(chat_buttons, text="Send Chat", command=self.send_chat_message).pack(fill="x")
-        ttk.Button(chat_buttons, text="Describe Drawing", command=self.describe_drawing).pack(fill="x", pady=(4, 0))
-        ttk.Button(chat_buttons, text="Clear Chat", command=self.clear_chat_history).pack(fill="x", pady=(4, 0))
+        ttk.Button(chat_buttons, text="Send Chat", style="Primary.TButton", command=self.send_chat_message).pack(fill="x")
+        ttk.Button(
+            chat_buttons,
+            text="Describe Drawing",
+            style="Secondary.TButton",
+            command=self.describe_drawing,
+        ).pack(fill="x", pady=(4, 0))
+        ttk.Button(
+            chat_buttons,
+            text="Clear Chat",
+            style="Secondary.TButton",
+            command=self.clear_chat_history,
+        ).pack(fill="x", pady=(4, 0))
         ttk.Checkbutton(
             chat_buttons,
             text="Auto-execute chat plans",
             variable=self.chat_auto_execute,
+            style="App.TCheckbutton",
         ).pack(anchor="w", pady=(6, 0))
 
-        output_notebook = ttk.Notebook(frame)
-        output_notebook.pack(fill="both", expand=True, pady=(8, 0))
+        output_notebook = ttk.Notebook(frame, style="App.TNotebook")
+        output_notebook.pack(fill="both", expand=True, pady=(10, 0))
         self.output_notebook = output_notebook
-
-        plan_tab = ttk.Frame(output_notebook)
+        plan_tab = ttk.Frame(output_notebook, style="Surface.TFrame", padding=(8, 8))
         output_notebook.add(plan_tab, text="Plan")
-        ttk.Label(plan_tab, text="Plan preview (JSON)").pack(anchor="w")
+        ttk.Label(plan_tab, text="Plan preview (JSON)", style="Body.TLabel").pack(anchor="w", pady=(0, 4))
         self.plan_output = ScrolledText(plan_tab, height=16, wrap="word")
+        style_scrolled_text(self.plan_output, self.theme)
         self.plan_output.pack(fill="both", expand=True)
 
-        planning_stream_tab = ttk.Frame(output_notebook)
+        planning_stream_tab = ttk.Frame(output_notebook, style="Surface.TFrame", padding=(8, 8))
         output_notebook.add(planning_stream_tab, text="Planning Stream")
         self.planning_stream_tab = planning_stream_tab
-        ttk.Label(planning_stream_tab, text="Live planner/model output while generating plan").pack(anchor="w")
+        ttk.Label(
+            planning_stream_tab,
+            text="Live planner/model output while generating plan",
+            style="Body.TLabel",
+        ).pack(anchor="w", pady=(0, 4))
         self.planning_stream_output = ScrolledText(
             planning_stream_tab,
             height=16,
             wrap="word",
             state="disabled",
         )
+        style_scrolled_text(self.planning_stream_output, self.theme)
         self.planning_stream_output.pack(fill="both", expand=True)
 
-        live_output_tab = ttk.Frame(output_notebook)
+        live_output_tab = ttk.Frame(output_notebook, style="Surface.TFrame", padding=(8, 8))
         output_notebook.add(live_output_tab, text="Live Output")
         self.live_output_tab = live_output_tab
-        ttk.Label(live_output_tab, text="Live execution/debug output").pack(anchor="w")
+        ttk.Label(live_output_tab, text="Live execution/debug output", style="Body.TLabel").pack(anchor="w", pady=(0, 4))
         self.log_output = ScrolledText(live_output_tab, height=16, wrap="word")
+        style_scrolled_text(self.log_output, self.theme)
         self.log_output.pack(fill="both", expand=True)
 
     def _bind_main_canvas_mousewheel(self, _event: tk.Event) -> None:
@@ -695,11 +786,12 @@ class AutoCADStandaloneApp:
             ttk.Label(
                 self.thumb_inner,
                 text="No visual references added.",
+                style="Caption.TLabel",
             ).pack(anchor="w", padx=8, pady=8)
             return
 
         for idx, (kind, label) in enumerate(entries):
-            item = ttk.Frame(self.thumb_inner)
+            item = ttk.Frame(self.thumb_inner, style="Card.TFrame", padding=(6, 6))
             item.grid(row=0, column=idx, padx=6, pady=6, sticky="n")
 
             image = self._load_thumbnail_image(kind, idx, label)
@@ -708,7 +800,7 @@ class AutoCADStandaloneApp:
 
             ttk.Label(item, image=photo).pack()
             caption = label if kind == "capture" else Path(label).name
-            ttk.Label(item, text=caption, width=18).pack()
+            ttk.Label(item, text=caption, width=18, style="Caption.TLabel").pack()
 
     def _load_thumbnail_image(self, kind: str, index: int, label: str) -> Image.Image:
         try:
@@ -721,7 +813,7 @@ class AutoCADStandaloneApp:
             img.thumbnail((160, 110))
             return img
         except Exception:
-            placeholder = Image.new("RGB", (160, 110), (240, 240, 240))
+            placeholder = Image.new("RGB", (160, 110), (30, 40, 62))
             return placeholder
 
     def add_reference_images(self) -> None:
