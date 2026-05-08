@@ -59,6 +59,23 @@ User / MCP Client / GUI
 - `uv` (recommended) or `pip`
 - LM Studio running locally for AI planning
 
+## Windows installer wizard (Setup EXE)
+For non-technical users, distribute the generated `AICAD-Setup-<version>.exe`.
+
+End-user install flow:
+1) Double-click `AICAD-Setup-<version>.exe`.
+2) Follow the wizard (choose install folder, optional desktop shortcut).
+3) Launch **AICAD** from Start Menu or desktop shortcut.
+4) In AutoCAD LT, load `lisp-code/mcp_dispatch.lsp` from the installed folder via `APPLOAD`.
+
+Build the installer (maintainer):
+```powershell
+powershell -ExecutionPolicy Bypass -File installer/build_installer.ps1
+```
+Outputs:
+- App bundle: `dist/AICAD/`
+- Wizard installer EXE: `dist/installer/AICAD-Setup-<version>.exe`
+
 ## Quick start (GUI workflow)
 1) Clone and install dependencies
 ```powershell

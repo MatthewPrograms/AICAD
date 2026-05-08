@@ -11,7 +11,34 @@ import structlog
 log = structlog.get_logger()
 
 # Paths
-LISP_DIR = Path(__file__).resolve().parent.parent.parent / "lisp-code"
+def _resolve_lisp_dir() -> Path:
+    """Resolve lisp-code directory for source and frozen installer builds."""
+    override = os.environ.get("AUTOCAD_MCP_LISP_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.extend(
+            [
+                exe_dir / "lisp-code",
+                exe_dir / "_internal" / "lisp-code",
+            ]
+        )
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "lisp-code")
+
+    candidates.append(Path(__file__).resolve().parent.parent.parent / "lisp-code")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
+
+
+LISP_DIR = _resolve_lisp_dir()
 IPC_DIR = Path(os.environ.get("AUTOCAD_MCP_IPC_DIR", "C:/temp"))
 
 # Backend selection
