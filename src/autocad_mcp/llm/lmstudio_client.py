@@ -87,9 +87,16 @@ class LMStudioClient:
         system_prompt: str,
         user_prompt: str,
         on_token: Callable[[str], None] | None = None,
+        max_tokens: int | None = None,
     ) -> dict:
         """Generate a JSON object response from LM Studio."""
-        return self._chat_json_from_messages(system_prompt, user_prompt, [], on_token=on_token)
+        return self._chat_json_from_messages(
+            system_prompt,
+            user_prompt,
+            [],
+            on_token=on_token,
+            max_tokens=max_tokens,
+        )
 
     def chat_json_with_images(
         self,
@@ -98,6 +105,7 @@ class LMStudioClient:
         image_paths: list[str] | None = None,
         image_b64_pngs: list[str] | None = None,
         on_token: Callable[[str], None] | None = None,
+        max_tokens: int | None = None,
     ) -> dict:
         """Generate a JSON response with image context."""
         image_data_urls: list[str] = []
@@ -105,7 +113,13 @@ class LMStudioClient:
             image_data_urls.append(self._image_path_to_data_url(path))
         for b64_png in (image_b64_pngs or []):
             image_data_urls.append(f"data:image/png;base64,{b64_png}")
-        return self._chat_json_from_messages(system_prompt, user_prompt, image_data_urls, on_token=on_token)
+        return self._chat_json_from_messages(
+            system_prompt,
+            user_prompt,
+            image_data_urls,
+            on_token=on_token,
+            max_tokens=max_tokens,
+        )
     def chat_text(
         self,
         system_prompt: str,
@@ -128,8 +142,12 @@ class LMStudioClient:
         user_prompt: str,
         image_data_urls: list[str],
         on_token: Callable[[str], None] | None = None,
+        max_tokens: int | None = None,
     ) -> dict:
         model_id = self._resolve_model()
+        resolved_max_tokens = self.config.max_json_tokens
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            resolved_max_tokens = max_tokens
         if image_data_urls:
             user_content: str | list[dict] = [{"type": "text", "text": user_prompt}]
             for image_url in image_data_urls:
@@ -140,7 +158,7 @@ class LMStudioClient:
         request_payload = {
             "model": model_id,
             "temperature": self.config.temperature,
-            "max_tokens": self.config.max_json_tokens,
+            "max_tokens": resolved_max_tokens,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
@@ -162,6 +180,13 @@ class LMStudioClient:
         try:
             return _loads_json(content)
         except json.JSONDecodeError as ex:
+            repaired_payload = self._repair_json_response(
+                model_id=model_id,
+                malformed_content=content,
+                max_tokens=resolved_max_tokens,
+            )
+            if repaired_payload is not None:
+                return repaired_payload
             raw_content = str(content)
             if len(raw_content) > 800:
                 raw_content = raw_content[:800] + "..."
@@ -171,6 +196,46 @@ class LMStudioClient:
                 f"LM Studio returned non-JSON content; ensure your model follows JSON-only instructions. "
                 f"Full content: {raw_content}"
             ) from ex
+
+    def _repair_json_response(
+        self,
+        model_id: str,
+        malformed_content: str,
+        max_tokens: int,
+    ) -> dict | None:
+        """Ask the model to repair malformed JSON into a strict JSON object."""
+        repair_input = malformed_content.strip()
+        if not repair_input:
+            return None
+        if len(repair_input) > 14000:
+            repair_input = repair_input[-14000:]
+        repair_prompt = (
+            "Repair the following malformed/truncated JSON into a valid JSON object.\n"
+            "Rules:\n"
+            "- Output JSON object only (no markdown, no prose).\n"
+            "- Preserve existing extracted content when possible.\n"
+            "- If parts are incomplete/truncated, keep only well-formed items and omit broken fragments.\n\n"
+            f"Malformed JSON input:\n{repair_input}"
+        )
+        repair_payload = {
+            "model": model_id,
+            "temperature": 0.0,
+            "max_tokens": max(512, min(2400, max_tokens)),
+            "messages": [
+                {"role": "system", "content": "You are a strict JSON repair utility."},
+                {"role": "user", "content": repair_prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            response = self._post_chat_completion(repair_payload, allow_response_format_fallback=True)
+            repaired_content = response["choices"][0]["message"]["content"]
+            repaired_text = self._sanitize_model_content(repaired_content)
+            if not repaired_text:
+                return None
+            return _loads_json(repaired_text)
+        except Exception:
+            return None
 
     def _stream_chat_completion_json(
         self,
@@ -492,21 +557,43 @@ def _loads_json(content: str) -> dict:
         raise json.JSONDecodeError("Empty JSON payload", text, 0)
     fenced = _strip_markdown_fence(text)
     parse_candidates: list[str] = [fenced]
-    embedded = _extract_balanced_json_candidate(fenced)
-    if embedded and embedded not in parse_candidates:
-        parse_candidates.append(embedded)
+    for embedded in _extract_balanced_json_candidates(fenced):
+        if embedded not in parse_candidates:
+            parse_candidates.append(embedded)
+    require_root_keys: set[str] | None = None
+    if fenced.lstrip().startswith("{"):
+        root_hints = ("\"actions\"", "\"analysis\"", "\"geometry\"", "\"layers\"", "\"annotations\"", "\"units\"")
+        if any(hint in fenced for hint in root_hints):
+            require_root_keys = {"actions", "analysis", "geometry", "layers", "annotations", "units"}
+
+    parsed_candidates: list[tuple[str, dict]] = []
     last_error: json.JSONDecodeError | None = None
     for candidate in parse_candidates:
         try:
             parsed = json.loads(candidate.strip())
         except json.JSONDecodeError as ex:
-            last_error = ex
+            sanitized_candidate = _sanitize_json_candidate_common_errors(candidate)
+            if sanitized_candidate != candidate:
+                try:
+                    parsed = json.loads(sanitized_candidate.strip())
+                except json.JSONDecodeError:
+                    last_error = ex
+                    continue
+            else:
+                last_error = ex
+                continue
+        if require_root_keys is not None and not isinstance(parsed, dict):
             continue
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, list):
-            return {"actions": parsed}
-        return {"value": parsed}
+        normalized = _normalize_json_payload(parsed)
+        if require_root_keys is not None and not (set(normalized.keys()) & require_root_keys):
+            continue
+        parsed_candidates.append((candidate, normalized))
+    if parsed_candidates:
+        _, selected = max(
+            parsed_candidates,
+            key=lambda item: _score_json_candidate(item[1], item[0]),
+        )
+        return selected
     if last_error is not None:
         raise last_error
     raise json.JSONDecodeError("Unable to decode JSON payload", text, 0)
@@ -528,16 +615,76 @@ def _strip_markdown_fence(text: str) -> str:
     return stripped.strip()
 
 
-def _extract_balanced_json_candidate(text: str) -> str | None:
+def _normalize_json_payload(parsed: object) -> dict:
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        return {"actions": parsed}
+    return {"value": parsed}
+
+
+def _score_json_candidate(payload: dict, source_text: str) -> float:
+    keys = {str(key) for key in payload.keys()}
+    score = float(len(keys))
+    key_weights = {
+        "actions": 40.0,
+        "analysis": 18.0,
+        "geometry": 28.0,
+        "layers": 12.0,
+        "annotations": 16.0,
+        "units": 10.0,
+        "notes": 6.0,
+    }
+    for key, weight in key_weights.items():
+        if key in keys:
+            score += weight
+    if not (keys & set(key_weights.keys())):
+        likely_fragment_keys = {
+            "name",
+            "type",
+            "layer",
+            "radius",
+            "center",
+            "points",
+            "start",
+            "end",
+            "start_angle",
+            "end_angle",
+        }
+        if keys and keys.issubset(likely_fragment_keys):
+            score -= 30.0
+    score += min(len(source_text), 4000) / 4000.0
+    return score
+
+
+def _extract_balanced_json_candidates(text: str) -> list[str]:
     start_positions = [idx for idx, ch in enumerate(text) if ch in "{["]
+    candidates: list[str] = []
+    seen: set[str] = set()
     for start in start_positions:
         end = _find_balanced_json_end(text, start)
         if end is None:
             continue
         candidate = text[start : end + 1].strip()
-        if candidate:
-            return candidate
-    return None
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+    candidates.sort(key=len, reverse=True)
+    return candidates
+
+
+def _sanitize_json_candidate_common_errors(candidate: str) -> str:
+    """Apply conservative repairs for common malformed JSON emitted by models."""
+    sanitized = candidate
+    # Remove orphan string tokens that appear where an object member should be, e.g. ,"0"}
+    sanitized = re.sub(
+        r',\s*"(?:[^"\\]|\\.)*"\s*(?=[}\]])',
+        "",
+        sanitized,
+    )
+    # Remove trailing commas before object/array closing delimiters.
+    sanitized = re.sub(r",\s*([}\]])", r"\1", sanitized)
+    return sanitized
 
 
 def _find_balanced_json_end(text: str, start_index: int) -> int | None:

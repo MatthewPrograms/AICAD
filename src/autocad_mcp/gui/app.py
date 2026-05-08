@@ -17,6 +17,7 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 import structlog
+from autocad_mcp.agent.image_import import ImageImportPipeline
 
 from autocad_mcp.agent.planner import ActionPlanner
 from autocad_mcp.agent.scene import SceneGraphBuilder, SceneGraphCache
@@ -39,11 +40,14 @@ class AutoCADStandaloneApp:
         normalized_default_lmstudio_url = self._normalize_lmstudio_base_url(default_lmstudio_url)
         self.lm_client = LMStudioClient(LMStudioConfig(base_url=normalized_default_lmstudio_url))
         self.planner = ActionPlanner(self.lm_client)
+        self.image_import_pipeline = ImageImportPipeline(self.lm_client)
         self.backend = FileIPCBackend()
         self.scene_graph_builder = SceneGraphBuilder(self.backend)
         self.scene_graph_cache = SceneGraphCache()
 
         self.current_plan: dict[str, Any] | None = None
+        self.current_image_ir: dict[str, Any] | None = None
+        self.current_image_import_qa: dict[str, Any] | None = None
         self.chat_history: list[dict[str, str]] = []
         self.reference_image_paths: list[str] = []
         self.captured_canvas_b64s: list[str] = []
@@ -165,6 +169,18 @@ class AutoCADStandaloneApp:
             text="Execute Approved Plan",
             style="Primary.TButton",
             command=self.execute_plan,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            action_row,
+            text="Preview Image→CAD",
+            style="Secondary.TButton",
+            command=self.preview_image_import_plan,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            action_row,
+            text="Execute Image→CAD",
+            style="Primary.TButton",
+            command=self.execute_image_import_plan,
         ).pack(side="left", padx=(8, 0))
 
         toggle_row = ttk.Frame(controls, style="Surface.TFrame")
@@ -745,6 +761,7 @@ class AutoCADStandaloneApp:
             )
         )
         self.planner = ActionPlanner(self.lm_client)
+        self.image_import_pipeline = ImageImportPipeline(self.lm_client)
         self.lm_base_url_var.set(normalized_url)
         try:
             previous_client.close()
@@ -1281,6 +1298,161 @@ class AutoCADStandaloneApp:
                 )
                 self.root.after(0, lambda r=response: self._append_chat_message("Agent", r))
                 self.root.after(0, lambda e=ex: self.plan_status.set(f"Plan: generation failed | {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+    def preview_image_import_plan(self) -> None:
+        if not (self.reference_image_paths or self.captured_canvas_b64s):
+            messagebox.showwarning(
+                "No images",
+                "Add reference images or capture AutoCAD canvas before previewing image import.",
+            )
+            return
+
+        prompt = self.prompt_input.get("1.0", "end").strip()
+        self.plan_status.set("Plan: extracting image IR...")
+        self._clear_planning_stream()
+
+        def worker() -> None:
+            try:
+                ensure_capture = self.auto_capture_before_plan.get()
+                image_paths, image_b64_pngs, visual_summary = self._prepare_lm_visual_context_sync(
+                    ensure_fresh_capture=ensure_capture,
+                    max_images=6,
+                )
+                self.root.after(0, lambda s=visual_summary: self._append_log(f"Image import visual context: {s}"))
+                if not (image_paths or image_b64_pngs):
+                    self.root.after(0, lambda: self.plan_status.set("Plan: image import failed | no images available"))
+                    return
+
+                autocad_context: str | None = None
+                if self.use_live_autocad_context.get():
+                    autocad_context, summary = self._collect_autocad_context_sync()
+                    if autocad_context:
+                        self.root.after(0, lambda s=summary: self._append_log(f"Live AutoCAD context captured: {s}"))
+                    else:
+                        self.root.after(0, lambda s=summary: self._append_log(f"Live AutoCAD context unavailable: {s}"))
+
+                self.root.after(0, lambda: self._begin_planning_stream("Image import IR extraction"))
+
+                def on_token(token: str) -> None:
+                    self._queue_planning_stream_text(token)
+
+                ir = self.image_import_pipeline.extract_ir(
+                    user_prompt=prompt,
+                    image_paths=image_paths,
+                    image_b64_pngs=image_b64_pngs,
+                    autocad_context=autocad_context,
+                    on_token=on_token,
+                )
+                self.root.after(0, lambda: self._end_planning_stream("IR extracted."))
+
+                plan, safety, qa = self.image_import_pipeline.build_plan_from_ir(
+                    ir,
+                    backend_name=self.backend.name,
+                    max_actions=120,
+                )
+                self.current_image_ir = ir
+                self.current_image_import_qa = qa
+                self.current_plan = plan
+
+                preview_payload = {
+                    "plan": plan,
+                    "image_import_ir": ir,
+                    "image_import_qa": qa,
+                    "safety": {"ok": safety.ok, "errors": safety.errors},
+                }
+                self.root.after(0, lambda p=preview_payload: self._set_plan_output(p))
+
+                if qa.get("ok"):
+                    warning_count = len(qa.get("warnings", []))
+                    self.root.after(
+                        0,
+                        lambda w=warning_count: self.plan_status.set(
+                            f"Plan: image import ready ({w} warning(s))"
+                        ),
+                    )
+                else:
+                    blocking_errors = qa.get("blocking_errors", qa.get("errors", []))
+                    err_text = "; ".join(blocking_errors) if isinstance(blocking_errors, list) else "QA checks failed."
+                    self.root.after(
+                        0,
+                        lambda e=err_text: self.plan_status.set(f"Plan: image import blocked | {e}"),
+                    )
+            except Exception as ex:
+                log.exception("preview_image_import_plan_failed")
+                error_text = f"Plan: image import preview failed | {ex}"
+                self.root.after(0, lambda e=error_text: self._cancel_planning_stream(e))
+                self.root.after(0, lambda e=error_text: self.plan_status.set(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def execute_image_import_plan(self) -> None:
+        if not self.current_plan:
+            messagebox.showwarning("No plan", "Generate an image import preview plan first.")
+            return
+        actions = self.current_plan.get("actions")
+        if not isinstance(actions, list) or not actions:
+            messagebox.showwarning("No actions", "Current image import plan has no actions to execute.")
+            return
+        qa = self.current_image_import_qa or {}
+        if qa and not qa.get("ok", False):
+            blocking_errors = qa.get("blocking_errors", qa.get("errors", []))
+            if not isinstance(blocking_errors, list):
+                blocking_errors = []
+            details = "\n".join(f"- {err}" for err in blocking_errors[:8])
+            messagebox.showwarning(
+                "Image import blocked",
+                (
+                    "Image import QA checks failed. Preview and resolve issues before execution."
+                    if not details
+                    else f"Image import QA checks failed:\n{details}"
+                ),
+            )
+            return
+
+        warnings = qa.get("warnings", []) if isinstance(qa, dict) else []
+        non_blocking_errors = qa.get("non_blocking_errors", []) if isinstance(qa, dict) else []
+        caution_items: list[str] = []
+        if isinstance(warnings, list):
+            caution_items.extend(str(item) for item in warnings if isinstance(item, str))
+        if isinstance(non_blocking_errors, list):
+            caution_items.extend(str(item) for item in non_blocking_errors if isinstance(item, str))
+        if caution_items:
+            warning_text = "\n".join(f"- {w}" for w in caution_items[:8])
+            proceed_with_warnings = messagebox.askyesno(
+                "Image import warnings",
+                f"QA warnings were detected:\n{warning_text}\n\nExecute anyway?",
+            )
+            if not proceed_with_warnings:
+                return
+
+        proceed = messagebox.askyesno(
+            "Confirm image import execution",
+            f"Execute {len(actions)} action(s) from image import plan?",
+        )
+        if not proceed:
+            return
+
+        self.plan_status.set("Plan: executing image import...")
+
+        def worker() -> None:
+            summary = self._execute_actions_sync(actions, source="image_import")
+            if summary.get("ok"):
+                success = summary.get("success_count", 0)
+                total = summary.get("total", len(actions))
+                self.root.after(
+                    0,
+                    lambda s=success, t=total: self.plan_status.set(
+                        f"Plan: image import executed ({s}/{t} actions succeeded)"
+                    ),
+                )
+            else:
+                self.root.after(
+                    0,
+                    lambda e=summary.get("error", "unknown error"): self.plan_status.set(
+                        f"Plan: image import execution failed | {e}"
+                    ),
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
