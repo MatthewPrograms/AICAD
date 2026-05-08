@@ -1,4 +1,5 @@
 # AICAD (AutoCAD LT AI Assistant)
+![AICAD Header Logo](assets/header-logo.png)
 AICAD is a local-first AI automation project for **AutoCAD LT 2024+ on Windows**.
 
 It combines:
