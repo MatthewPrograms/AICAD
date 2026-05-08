@@ -32,7 +32,19 @@ Rules:
 - Output valid JSON only; no markdown/prose.
 - Include only detectable elements; avoid guessing hidden geometry.
 - Keep coordinates in a consistent local 2D frame.
+- Handle diverse image styles (technical drawing, sketch, logo, and photo) by prioritizing high-confidence structural geometry.
+- Prefer stable primitives over noisy fragments and avoid duplicate entities describing the same shape.
+- Preserve likely orthogonality for near-horizontal and near-vertical edges when visually clear.
 - Keep output compact and deterministic.
+""".strip()
+
+IMAGE_IMPORT_REFINEMENT_SYSTEM_PROMPT = """
+You refine an existing image-to-CAD IR into a more accurate CAD-friendly IR.
+Return JSON only using the same schema as the extraction stage.
+Refinement priorities:
+- Keep high-confidence geometry and key annotations.
+- Remove obvious noise, malformed entities, and duplicates.
+- Preserve shape/layout fidelity over maximum entity count.
 """.strip()
 IMAGE_IMPORT_MAX_JSON_TOKENS = 2000
 
@@ -56,7 +68,7 @@ class ImageImportPipeline:
         prompt = self._compose_extraction_prompt(user_prompt, autocad_context=autocad_context)
         if on_token is not None:
             on_token("\n[image_import_ir]\n")
-        raw_ir = self.lm_client.chat_json_with_images(
+        primary_raw_ir = self.lm_client.chat_json_with_images(
             IMAGE_IMPORT_SYSTEM_PROMPT,
             prompt,
             image_paths=image_paths,
@@ -64,7 +76,30 @@ class ImageImportPipeline:
             on_token=on_token,
             max_tokens=IMAGE_IMPORT_MAX_JSON_TOKENS,
         )
-        return self._normalize_ir(raw_ir)
+        primary_ir = self._normalize_ir(primary_raw_ir)
+        if not self._should_attempt_refinement(primary_ir):
+            return primary_ir
+
+        if on_token is not None:
+            on_token("\n[image_import_ir_refine]\n")
+        refinement_prompt = self._compose_refinement_prompt(
+            user_prompt=user_prompt,
+            candidate_ir=primary_ir,
+            autocad_context=autocad_context,
+        )
+        try:
+            refined_raw_ir = self.lm_client.chat_json_with_images(
+                IMAGE_IMPORT_REFINEMENT_SYSTEM_PROMPT,
+                refinement_prompt,
+                image_paths=image_paths,
+                image_b64_pngs=image_b64_pngs,
+                on_token=on_token,
+                max_tokens=IMAGE_IMPORT_MAX_JSON_TOKENS,
+            )
+        except Exception:
+            return primary_ir
+        refined_ir = self._normalize_ir(refined_raw_ir)
+        return self._select_better_ir(primary_ir, refined_ir)
 
     def build_plan_from_ir(
         self,
@@ -168,6 +203,88 @@ class ImageImportPipeline:
             f"{trimmed_context}\n\n"
             "Extract image geometry into the required IR schema."
         )
+
+    def _compose_refinement_prompt(
+        self,
+        user_prompt: str,
+        candidate_ir: dict[str, Any],
+        autocad_context: str | None = None,
+    ) -> str:
+        objective = (user_prompt or "").strip() or "Convert this image into accurate CAD geometry and text."
+        candidate_preview = str(candidate_ir)
+        if len(candidate_preview) > 8000:
+            candidate_preview = candidate_preview[:8000] + "...[truncated]"
+        if not autocad_context:
+            return (
+                f"User objective:\n{objective}\n\n"
+                "Candidate IR to refine:\n"
+                f"{candidate_preview}\n\n"
+                "Refine this IR to improve geometric accuracy and remove noisy artifacts."
+            )
+        trimmed_context = autocad_context.strip()
+        if len(trimmed_context) > 2500:
+            trimmed_context = trimmed_context[:2500] + "\n...[truncated]"
+        return (
+            f"User objective:\n{objective}\n\n"
+            "Current drawing context (optional grounding):\n"
+            f"{trimmed_context}\n\n"
+            "Candidate IR to refine:\n"
+            f"{candidate_preview}\n\n"
+            "Refine this IR to improve geometric accuracy and remove noisy artifacts."
+        )
+
+    def _should_attempt_refinement(self, ir: dict[str, Any]) -> bool:
+        geometry = ir.get("geometry")
+        geometry_count = len(geometry) if isinstance(geometry, list) else 0
+        quality_score = self._score_ir_quality(ir)
+        return geometry_count < 4 or quality_score < 8.0
+
+    def _select_better_ir(self, primary_ir: dict[str, Any], refined_ir: dict[str, Any]) -> dict[str, Any]:
+        if self._score_ir_quality(refined_ir) > self._score_ir_quality(primary_ir):
+            return refined_ir
+        return primary_ir
+
+    def _score_ir_quality(self, ir: dict[str, Any]) -> float:
+        geometry_items = ir.get("geometry") if isinstance(ir.get("geometry"), list) else []
+        annotation_items = ir.get("annotations") if isinstance(ir.get("annotations"), list) else []
+        note_items = ir.get("notes") if isinstance(ir.get("notes"), list) else []
+        bounds = ir.get("bounds")
+
+        score = 0.0
+        geometry_count = len(geometry_items)
+        score += min(60, geometry_count) * 0.8
+        score += min(20, len(annotation_items)) * 0.15
+        if geometry_count == 0:
+            score -= 20.0
+        elif geometry_count > 220:
+            score -= (geometry_count - 220) * 0.15
+
+        geometry_types = {
+            str(item.get("type")).strip().lower()
+            for item in geometry_items
+            if isinstance(item, dict) and item.get("type")
+        }
+        score += min(8, len(geometry_types)) * 1.25
+        score -= _estimate_duplicate_geometry_count(geometry_items) * 1.5
+
+        if isinstance(bounds, dict):
+            min_x = _as_float(bounds.get("min_x"))
+            min_y = _as_float(bounds.get("min_y"))
+            max_x = _as_float(bounds.get("max_x"))
+            max_y = _as_float(bounds.get("max_y"))
+            if None not in (min_x, min_y, max_x, max_y):
+                span_x = float(max_x) - float(min_x)
+                span_y = float(max_y) - float(min_y)
+                if span_x > 0 and span_y > 0 and math.isfinite(span_x) and math.isfinite(span_y):
+                    score += 3.0
+                else:
+                    score -= 6.0
+            else:
+                score -= 4.0
+
+        if any(isinstance(note, str) and "non_object" in note.lower() for note in note_items):
+            score -= 15.0
+        return score
 
     def _ir_to_actions(self, ir: dict[str, Any], max_actions: int = 120) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
@@ -410,7 +527,6 @@ class ImageImportPipeline:
                 layers.append(entry)
 
         geometry: list[dict[str, Any]] = []
-        points_for_bounds: list[tuple[float, float]] = []
         raw_geometry_items = _extract_items(
             raw_ir,
             ("geometry", "geometries", "entities", "objects", "shapes", "primitives"),
@@ -422,7 +538,7 @@ class ImageImportPipeline:
             if normalized is None:
                 continue
             geometry.append(normalized)
-            points_for_bounds.extend(_collect_points_from_geometry_item(normalized))
+        geometry = _post_process_geometry(geometry)
 
         annotations: list[dict[str, Any]] = []
         raw_annotation_items = _extract_items(
@@ -436,9 +552,7 @@ class ImageImportPipeline:
             if normalized is None:
                 continue
             annotations.append(normalized)
-            point = _coerce_point(normalized.get("point"))
-            if point is not None:
-                points_for_bounds.append(point)
+        annotations = _post_process_annotations(annotations)
 
         notes: list[str] = []
         raw_notes = raw_ir.get("notes")
@@ -447,6 +561,13 @@ class ImageImportPipeline:
                 if isinstance(value, str) and value.strip():
                     notes.append(value.strip())
 
+        points_for_bounds: list[tuple[float, float]] = []
+        for item in geometry:
+            points_for_bounds.extend(_collect_points_from_geometry_item(item))
+        for item in annotations:
+            point = _coerce_point(item.get("point"))
+            if point is not None:
+                points_for_bounds.append(point)
         bounds = _compute_bounds(points_for_bounds)
         return {
             "units": units,
@@ -733,3 +854,275 @@ def _compute_bounds(points: list[tuple[float, float]]) -> dict[str, float] | Non
         "max_x": max(xs),
         "max_y": max(ys),
     }
+
+
+def _post_process_geometry(geometry: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for item in geometry:
+        normalized = _sanitize_geometry_for_accuracy(item)
+        if normalized is not None:
+            cleaned.append(normalized)
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in cleaned:
+        signature = _geometry_signature(item)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(item)
+    return deduped
+
+
+def _post_process_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    seen: set[tuple[str, float, float]] = set()
+    for item in annotations:
+        text_value = item.get("text")
+        point = _coerce_point(item.get("point"))
+        if not isinstance(text_value, str) or not text_value.strip() or point is None:
+            continue
+        normalized_text = text_value.strip()
+        if len(normalized_text) > 160:
+            normalized_text = normalized_text[:160]
+        height = _as_float(item.get("height"))
+        if height is None or height <= 0:
+            height = 2.5
+        height = max(0.1, min(height, 1000.0))
+        signature = (normalized_text.lower(), _quantize(point[0]), _quantize(point[1]))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        normalized_item: dict[str, Any] = {
+            "text": normalized_text,
+            "point": [_round4(point[0]), _round4(point[1])],
+            "height": _round4(height),
+        }
+        layer = _sanitize_layer_name(item.get("layer"))
+        if layer:
+            normalized_item["layer"] = layer
+        cleaned.append(normalized_item)
+    return cleaned
+
+
+def _sanitize_geometry_for_accuracy(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "").strip().lower()
+    layer = _sanitize_layer_name(item.get("layer"))
+    base: dict[str, Any] = {"type": item_type}
+    if layer:
+        base["layer"] = layer
+
+    if item_type == "line":
+        start = _coerce_point(item.get("start"))
+        end = _coerce_point(item.get("end"))
+        if start is None or end is None:
+            return None
+        x1, y1 = start
+        x2, y2 = end
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length <= 1e-4:
+            return None
+        if abs(dx) <= length * 0.015:
+            x = (x1 + x2) / 2.0
+            x1 = x
+            x2 = x
+        elif abs(dy) <= length * 0.015:
+            y = (y1 + y2) / 2.0
+            y1 = y
+            y2 = y
+        if math.hypot(x2 - x1, y2 - y1) <= 1e-4:
+            return None
+        base["start"] = [_round4(x1), _round4(y1)]
+        base["end"] = [_round4(x2), _round4(y2)]
+        return base
+
+    if item_type == "circle":
+        center = _coerce_point(item.get("center"))
+        radius = _as_float(item.get("radius"))
+        if center is None or radius is None or radius <= 1e-4:
+            return None
+        base["center"] = [_round4(center[0]), _round4(center[1])]
+        base["radius"] = _round4(radius)
+        return base
+
+    if item_type == "arc":
+        center = _coerce_point(item.get("center"))
+        radius = _as_float(item.get("radius"))
+        start_angle = _as_float(item.get("start_angle"))
+        end_angle = _as_float(item.get("end_angle"))
+        if center is None or radius is None or radius <= 1e-4 or start_angle is None or end_angle is None:
+            return None
+        sweep = (end_angle - start_angle) % 360.0
+        if sweep < 0.5:
+            return None
+        base["center"] = [_round4(center[0]), _round4(center[1])]
+        base["radius"] = _round4(radius)
+        base["start_angle"] = _round4(start_angle)
+        base["end_angle"] = _round4(end_angle)
+        return base
+
+    if item_type == "polyline":
+        points_raw = item.get("points")
+        if not isinstance(points_raw, list):
+            return None
+        points: list[tuple[float, float]] = []
+        for value in points_raw:
+            point = _coerce_point(value)
+            if point is None:
+                continue
+            if points and _points_close(point, points[-1], tolerance=1e-4):
+                continue
+            points.append(point)
+        if len(points) < 2:
+            return None
+        closed = bool(item.get("closed", False))
+        if closed and _points_close(points[0], points[-1], tolerance=1e-4):
+            points = points[:-1]
+        if len(points) < 2:
+            return None
+        if closed and len(points) < 3:
+            return None
+        base["points"] = [[_round4(point[0]), _round4(point[1])] for point in points]
+        base["closed"] = closed
+        return base
+
+    if item_type == "rectangle":
+        corner1 = _coerce_point(item.get("corner1"))
+        corner2 = _coerce_point(item.get("corner2"))
+        if corner1 is None or corner2 is None:
+            return None
+        min_x = min(corner1[0], corner2[0])
+        min_y = min(corner1[1], corner2[1])
+        max_x = max(corner1[0], corner2[0])
+        max_y = max(corner1[1], corner2[1])
+        if abs(max_x - min_x) <= 1e-4 or abs(max_y - min_y) <= 1e-4:
+            return None
+        base["corner1"] = [_round4(min_x), _round4(min_y)]
+        base["corner2"] = [_round4(max_x), _round4(max_y)]
+        return base
+
+    if item_type == "ellipse":
+        center = _coerce_point(item.get("center"))
+        major_axis = _coerce_point(item.get("major_axis"))
+        ratio = _as_float(item.get("ratio"))
+        if center is None or major_axis is None or ratio is None:
+            return None
+        if math.hypot(major_axis[0], major_axis[1]) <= 1e-4:
+            return None
+        if ratio <= 1e-4 or ratio > 1.0:
+            return None
+        base["center"] = [_round4(center[0]), _round4(center[1])]
+        base["major_axis"] = [_round4(major_axis[0]), _round4(major_axis[1])]
+        base["ratio"] = _round4(ratio)
+        return base
+
+    return None
+
+
+def _geometry_signature(item: dict[str, Any]) -> tuple[Any, ...]:
+    item_type = str(item.get("type") or "").strip().lower()
+    if item_type == "line":
+        start = _coerce_point(item.get("start"))
+        end = _coerce_point(item.get("end"))
+        if start is None or end is None:
+            return ("line", "invalid")
+        a = (_quantize(start[0]), _quantize(start[1]))
+        b = (_quantize(end[0]), _quantize(end[1]))
+        ordered = tuple(sorted((a, b)))
+        return ("line", *ordered, str(item.get("layer") or ""))
+    if item_type == "circle":
+        center = _coerce_point(item.get("center"))
+        radius = _as_float(item.get("radius"))
+        if center is None or radius is None:
+            return ("circle", "invalid")
+        return (
+            "circle",
+            _quantize(center[0]),
+            _quantize(center[1]),
+            _quantize(radius),
+            str(item.get("layer") or ""),
+        )
+    if item_type == "arc":
+        center = _coerce_point(item.get("center"))
+        radius = _as_float(item.get("radius"))
+        start_angle = _as_float(item.get("start_angle"))
+        end_angle = _as_float(item.get("end_angle"))
+        if center is None or radius is None or start_angle is None or end_angle is None:
+            return ("arc", "invalid")
+        return (
+            "arc",
+            _quantize(center[0]),
+            _quantize(center[1]),
+            _quantize(radius),
+            _quantize(start_angle),
+            _quantize(end_angle),
+            str(item.get("layer") or ""),
+        )
+    if item_type == "rectangle":
+        corner1 = _coerce_point(item.get("corner1"))
+        corner2 = _coerce_point(item.get("corner2"))
+        if corner1 is None or corner2 is None:
+            return ("rectangle", "invalid")
+        x1, y1 = corner1
+        x2, y2 = corner2
+        return (
+            "rectangle",
+            _quantize(min(x1, x2)),
+            _quantize(min(y1, y2)),
+            _quantize(max(x1, x2)),
+            _quantize(max(y1, y2)),
+            str(item.get("layer") or ""),
+        )
+    if item_type == "polyline":
+        points_raw = item.get("points")
+        if not isinstance(points_raw, list):
+            return ("polyline", "invalid")
+        points = [point for point in (_coerce_point(value) for value in points_raw) if point is not None]
+        encoded = tuple((_quantize(point[0]), _quantize(point[1])) for point in points)
+        reverse_encoded = tuple(reversed(encoded))
+        canonical = min(encoded, reverse_encoded) if reverse_encoded else encoded
+        return ("polyline", canonical, bool(item.get("closed", False)), str(item.get("layer") or ""))
+    if item_type == "ellipse":
+        center = _coerce_point(item.get("center"))
+        major_axis = _coerce_point(item.get("major_axis"))
+        ratio = _as_float(item.get("ratio"))
+        if center is None or major_axis is None or ratio is None:
+            return ("ellipse", "invalid")
+        return (
+            "ellipse",
+            _quantize(center[0]),
+            _quantize(center[1]),
+            _quantize(major_axis[0]),
+            _quantize(major_axis[1]),
+            _quantize(ratio),
+            str(item.get("layer") or ""),
+        )
+    return (item_type or "unknown", str(item))
+
+
+def _estimate_duplicate_geometry_count(geometry: list[dict[str, Any]]) -> int:
+    seen: set[tuple[Any, ...]] = set()
+    duplicates = 0
+    for item in geometry:
+        if not isinstance(item, dict):
+            continue
+        signature = _geometry_signature(item)
+        if signature in seen:
+            duplicates += 1
+            continue
+        seen.add(signature)
+    return duplicates
+
+
+def _points_close(a: tuple[float, float], b: tuple[float, float], tolerance: float = 1e-4) -> bool:
+    return math.hypot(a[0] - b[0], a[1] - b[1]) <= tolerance
+
+
+def _quantize(value: float, precision: int = 3) -> float:
+    return float(round(value, precision))
+
+
+def _round4(value: float) -> float:
+    return float(round(value, 4))

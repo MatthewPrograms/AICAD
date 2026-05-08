@@ -407,6 +407,22 @@ class TestConfigurableTimeout:
         assert TIMEOUT == IPC_TIMEOUT
 
 
+class TestRetriggerSafety:
+    def test_retrigger_allowed_for_read_only_commands(self):
+        from autocad_mcp.backends.file_ipc import _is_retrigger_safe_command
+
+        assert _is_retrigger_safe_command("ping") is True
+        assert _is_retrigger_safe_command("drawing-info") is True
+        assert _is_retrigger_safe_command("entity-list") is True
+
+    def test_retrigger_blocked_for_mutating_commands(self):
+        from autocad_mcp.backends.file_ipc import _is_retrigger_safe_command
+
+        assert _is_retrigger_safe_command("drawing-create") is False
+        assert _is_retrigger_safe_command("entity-erase") is False
+        assert _is_retrigger_safe_command("create-line") is False
+
+
 # ---------------------------------------------------------------------------
 # Stale .lsp file cleanup
 # ---------------------------------------------------------------------------

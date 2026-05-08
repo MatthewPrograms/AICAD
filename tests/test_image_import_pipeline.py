@@ -13,6 +13,20 @@ class _DummyLMClient:
         return self.payload
 
 
+class _DummyLMClientSequence:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.calls = 0
+
+    def chat_json_with_images(self, *_args, **_kwargs):
+        self.calls += 1
+        if not self.payloads:
+            return {}
+        if len(self.payloads) == 1:
+            return self.payloads[0]
+        return self.payloads.pop(0)
+
+
 def test_extract_ir_requires_at_least_one_image():
     pipeline = ImageImportPipeline(_DummyLMClient({}))  # type: ignore[arg-type]
     with pytest.raises(ValueError):
@@ -43,6 +57,79 @@ def test_build_plan_from_ir_maps_geometry_and_annotations():
     assert "annotation.create_text" in operations
     assert safety.ok is True
     assert qa.get("ok") is True
+
+
+def test_extract_ir_uses_refinement_when_primary_is_low_quality():
+    primary = {
+        "units": "unknown",
+        "geometry": [{"type": "line", "start": [0, 0], "end": [0, 0]}],
+        "annotations": [],
+        "notes": [],
+    }
+    refined = {
+        "units": "unknown",
+        "geometry": [{"type": "line", "start": [0, 0], "end": [10, 0], "layer": "0"}],
+        "annotations": [],
+        "notes": [],
+    }
+    lm = _DummyLMClientSequence([primary, refined])
+    pipeline = ImageImportPipeline(lm)  # type: ignore[arg-type]
+    ir = pipeline.extract_ir("import", image_paths=["example.png"], image_b64_pngs=None)
+    assert lm.calls == 2
+    assert len(ir["geometry"]) == 1
+    assert ir["geometry"][0]["type"] == "line"
+
+
+def test_build_plan_from_ir_cleans_duplicate_and_degenerate_entities():
+    pipeline = ImageImportPipeline(_DummyLMClient({}))  # type: ignore[arg-type]
+    plan, safety, qa = pipeline.build_plan_from_ir(
+        {
+            "units": "unknown",
+            "geometry": [
+                {"type": "line", "start": [0, 0], "end": [100, 0.4], "layer": "EDGE"},
+                {"type": "line", "start": [100, 0.4], "end": [0, 0], "layer": "EDGE"},
+                {"type": "line", "start": [5, 5], "end": [5, 5], "layer": "EDGE"},
+                {
+                    "type": "polyline",
+                    "points": [[0, 0], [0, 0], [5, 0], [5, 5], [5, 5]],
+                    "closed": False,
+                    "layer": "EDGE",
+                },
+            ],
+            "annotations": [
+                {"text": "NOTE", "point": [10, 10], "height": 2.5, "layer": "TEXT"},
+                {"text": "NOTE", "point": [10, 10], "height": 2.5, "layer": "TEXT"},
+            ],
+            "notes": [],
+        },
+        backend_name="file_ipc",
+    )
+    assert safety.ok is True
+    assert qa.get("ok") is True
+    actions = plan.get("actions")
+    assert isinstance(actions, list)
+
+    line_actions = [
+        action for action in actions if action.get("tool") == "entity" and action.get("operation") == "create_line"
+    ]
+    assert len(line_actions) == 1
+    line_data = line_actions[0]["data"]
+    assert line_data["y1"] == line_data["y2"]
+
+    polyline_actions = [
+        action
+        for action in actions
+        if action.get("tool") == "entity" and action.get("operation") == "create_polyline"
+    ]
+    assert len(polyline_actions) == 1
+    assert len(polyline_actions[0]["data"]["points"]) == 3
+
+    text_actions = [
+        action
+        for action in actions
+        if action.get("tool") == "annotation" and action.get("operation") == "create_text"
+    ]
+    assert len(text_actions) == 1
 
 
 def test_extract_ir_normalizes_non_object_model_output():

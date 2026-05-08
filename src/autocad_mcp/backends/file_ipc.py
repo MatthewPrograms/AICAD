@@ -32,6 +32,22 @@ TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
 RETRIGGER_ATTEMPTS = 2
 RETRIGGER_INTERVAL = max(1.5, TIMEOUT / 3.0)
+RETRIGGER_SAFE_COMMANDS = frozenset(
+    {
+        "ping",
+        "drawing-info",
+        "drawing-get-variables",
+        "entity-list",
+        "entity-count",
+        "entity-get",
+        "layer-list",
+        "block-list",
+    }
+)
+
+
+def _is_retrigger_safe_command(command: str) -> bool:
+    return command in RETRIGGER_SAFE_COMMANDS
 
 def _preview_for_log(value, max_len: int = 800) -> str:
     """Render a bounded preview string suitable for structured logs."""
@@ -199,6 +215,7 @@ class FileIPCBackend(AutoCADBackend):
             # Poll for result
             deadline = time.time() + TIMEOUT
             retrigger_count = 0
+            allowed_retriggers = RETRIGGER_ATTEMPTS if _is_retrigger_safe_command(command) else 0
             next_retrigger_ts = time.time() + RETRIGGER_INTERVAL
             while time.time() < deadline:
                 if result_file.exists():
@@ -228,11 +245,12 @@ class FileIPCBackend(AutoCADBackend):
                             )
                     except (json.JSONDecodeError, OSError):
                         pass  # File may be partially written, retry
-                if retrigger_count < RETRIGGER_ATTEMPTS and time.time() >= next_retrigger_ts:
+                if retrigger_count < allowed_retriggers and time.time() >= next_retrigger_ts:
                     log.warning(
                         "ipc_result_not_seen_retriggering_dispatch",
                         request_id=request_id,
                         attempt=retrigger_count + 1,
+                        command=command,
                     )
                     try:
                         self._type_dispatch_trigger()
